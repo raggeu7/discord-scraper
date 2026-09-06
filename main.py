@@ -1,81 +1,115 @@
-from colorama import Fore
-import json
 import os
+import asyncio
+import re
+import urllib.parse
 import discord
+from discord.ext import commands
+from playwright.async_api import async_playwright
 
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+TARGET_SITE_URL = os.getenv("TARGET_SITE_URL", "https://example-arabic-cinema-site.com")
 
-from discord.ext import (
-    commands,
-    tasks
-)
+# إعداد الصلاحيات بصورة صحيحة لتفادي خطأ missing intents
+intents = discord.Intents.default()
+intents.message_content = True
 
+# استخدام bot بدلاً من client لدعم البريفكس &
+bot = commands.Bot(command_prefix="&", intents=intents)
 
+async def scrape_media_stream(query: str):
+    found_media = {"url": None, "referer": None, "type": None}
+    search_url = f"{TARGET_SITE_URL}/search?q={urllib.parse.quote(query)}"
 
-client = discord.Client()
-client = commands.Bot(
-    command_prefix="!",
-    self_bot=True
-)
-client.remove_command('help')
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu"
+            ]
+        )
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        )
+        page = await context.new_page()
 
-with open('config.json') as f:
-    config = json.load(f)
-    
-token = config.get("token")
-os.system('cls')
+        page.on("popup", lambda popup: asyncio.create_async_task(popup.close()))
 
-print(f"{Fore.WHITE}[ {Fore.CYAN}§ {Fore.WHITE}] {Fore.LIGHTBLACK_EX}Discord Chat Scraper made by {Fore.WHITE}LnX{Fore.LIGHTBLACK_EX} | Licensed under {Fore.WHITE}MIT {Fore.LIGHTBLACK_EX}License")
-print(f"{Fore.WHITE}[ {Fore.CYAN}§ {Fore.WHITE}] {Fore.LIGHTBLACK_EX}You can follow me on Github: {Fore.WHITE}https://github.com/lnxcz")
+        async def handle_request(request):
+            url = request.url
+            if re.search(r"\.(m3u8|mp4)(\?|$)", url, re.IGNORECASE):
+                if not found_media["url"]:
+                    found_media["url"] = url
+                    found_media["referer"] = request.headers.get("referer", TARGET_SITE_URL)
+                    found_media["type"] = "Direct Stream (m3u8/mp4)"
 
-print(f"\n{Fore.WHITE}[ {Fore.GREEN}+ {Fore.WHITE}] {Fore.LIGHTBLACK_EX}Bot is ready!")
-print(f"{Fore.WHITE}[ {Fore.YELLOW}? {Fore.WHITE}] {Fore.LIGHTBLACK_EX}Write {Fore.WHITE}!scrape <number of messages>{Fore.LIGHTBLACK_EX} to log messages\n")
+        page.on("request", handle_request)
 
-def Init():
-    if config.get('token') == "token-here":
-        os.system('cls')
-        print(f"\n\n{Fore.WHITE}[ {Fore.RED}E {Fore.WHITE}] {Fore.LIGHTBLACK_EX}You didnt put your token in the config.json file\n\n"+Fore.RESET)
-        exit()
-    else:
-        token = config.get('token')
         try:
-            client.run(token, bot=False, reconnect=True)
-            os.system(f'Discord message scraper')
-        except discord.errors.LoginFailure:
-            print(f"\n\n{Fore.WHITE}[ {Fore.RED}E {Fore.WHITE}] {Fore.LIGHTBLACK_EX}Token is invalid\n\n"+Fore.RESET)
-            exit()
+            await page.goto(search_url, wait_until="domcontentloaded", timeout=20000)
 
+            first_result = page.locator(".search-results .item a, .movie-card a").first
+            if await first_result.count() > 0:
+                await first_result.click()
+                await page.wait_for_load_state("domcontentloaded")
 
-@client.command()
-async def scrape(ctx, amount: int):
-    f = open(f"scraped/{ctx.message.channel}.txt","w+", encoding="UTF-8")
-    total = amount
-    print(f"{Fore.WHITE}[ {Fore.YELLOW}? {Fore.WHITE}] {Fore.LIGHTBLACK_EX}Scraping {Fore.WHITE}{amount}{Fore.LIGHTBLACK_EX} messages to {Fore.WHITE}scraped/{ctx.message.channel}.txt{Fore.LIGHTBLACK_EX}!")
-    async for message in ctx.message.channel.history(limit=amount):
-        attachments = [attachment.url for attachment in message.attachments if message.attachments]
-        try:
-            if attachments:
-                realatt = attachments[0]
-                f.write(f"({message.created_at}) {message.author}: {message.content} ({realatt})\n")
-                print(f"{Fore.WHITE}[ {Fore.GREEN}+ {Fore.WHITE}] {Fore.LIGHTBLACK_EX}Scraped message")
-            else:
-                f.write(f"({message.created_at}) {message.author}: {message.content}\n")
-                print(f"{Fore.WHITE}[ {Fore.GREEN}+ {Fore.WHITE}] {Fore.LIGHTBLACK_EX}Scraped message")
+            play_button = page.locator("button.play-btn, .player-container iframe, #player").first
+            if await play_button.count() > 0:
+                await play_button.click(force=True)
+
+            for _ in range(10):
+                if found_media["url"]:
+                    break
+                await asyncio.sleep(0.5)
+
+            if not found_media["url"]:
+                for frame in page.frames:
+                    if any(domain in frame.url for domain in ["player", "embed", "vidsrc", "stream"]):
+                        found_media["url"] = frame.url
+                        found_media["referer"] = page.url
+                        found_media["type"] = "Embed / iframe Server"
+                        break
+
         except Exception as e:
-            print(f"{Fore.WHITE}[ {Fore.RED}- {Fore.WHITE}] {Fore.LIGHTBLACK_EX}Cannot scrape message from {Fore.WHITE}{message.author}")
-            print(f"{Fore.WHITE}[ {Fore.RED}E {Fore.WHITE}] {Fore.LIGHTBLACK_EX} {Fore.WHITE}{e}")
-            total = total - 1
-    print(f"{Fore.WHITE}[ {Fore.YELLOW}? {Fore.WHITE}] {Fore.LIGHTBLACK_EX}Succesfully scraped {Fore.WHITE}{total} {Fore.LIGHTBLACK_EX}messages!\n\n{Fore.WHITE}")
+            print(f"[Error Scraper]: {e}")
+        finally:
+            await browser.close()
 
+    return found_media
 
-@client.event
-async def on_command_error(ctx, error):
-    error_str = str(error)
-    error = getattr(error, 'original', error)
-    if isinstance(error, commands.CommandNotFound):
-        return
-    elif isinstance(error, discord.errors.Forbidden):
-        print(f"{Fore.WHITE}[ {Fore.RED}E {Fore.WHITE}] {Fore.LIGHTBLACK_EX}Discord error: {error}"+Fore.RESET)    
+@bot.event
+async def on_ready():
+    print(f"تم تسجيل الدخول بنجاح كـ: {bot.user.name}")
+    print("البوت جاهز لاستقبال الأوامر مثل: &watch")
+
+@bot.command(name="watch")
+async def watch(ctx, *, title: str):
+    msg = await ctx.send(f"🔍 جاري البحث واستخراج المشغل المباشر لـ: **{title}**...")
+    result = await scrape_media_stream(title)
+
+    if result["url"]:
+        embed = discord.Embed(
+            title=f"🎬 نتائج البحث: {title}",
+            color=discord.Color.green(),
+            description="تم استخراج رابط المشغل بنجاح."
+        )
+        embed.add_field(name="نوع السيرفر", value=f"`{result['type']}`", inline=False)
+        embed.add_field(name="رابط المشغل", value=f"```{result['url']}```", inline=False)
+        if result["referer"]:
+            embed.add_field(name="Referer المطلوبة", value=f"`{result['referer']}`", inline=False)
+
+        await msg.edit(content=None, embed=embed)
     else:
-        print(f"{Fore.WHITE}[ {Fore.RED}E {Fore.WHITE}] {Fore.LIGHTBLACK_EX}{error_str}"+Fore.RESET)
+        embed = discord.Embed(
+            title="❌ لم يتم العثور على رابط",
+            description=f"تعذر استخراج رابط مباشر للعمل: **{title}**.",
+            color=discord.Color.red()
+        )
+        await msg.edit(content=None, embed=embed)
 
-Init()
+if __name__ == "__main__":
+    if not DISCORD_TOKEN:
+        raise ValueError("خطأ: لم يتم ضبط DISCORD_TOKEN في متغيرات بيئة Railway!")
+    bot.run(DISCORD_TOKEN)
