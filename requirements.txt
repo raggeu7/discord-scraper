@@ -1,2 +1,2 @@
-discord
-colorama
+discord.py>=2.3.0
+playwright>=1.40.0
