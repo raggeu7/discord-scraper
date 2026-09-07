@@ -1,137 +1,187 @@
+import asyncio
+import json
+import logging
 import os
 import re
-import json
-import asyncio
 import urllib.parse
+from dataclasses import dataclass
+from typing import Optional
+
 import discord
 from discord.ext import commands
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 
-# جلب المتغيرات من بيئة التشغيل
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-TARGET_SITE_URL = os.getenv("TARGET_SITE_URL", "https://shaiid4u.co").rstrip('/')
 
-# إعداد البوت والصلاحيات
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("discord-scraper")
+
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
+TARGET_SITE_URL = os.getenv("TARGET_SITE_URL", "https://shaiid4u.co").strip().rstrip("/")
+COMMAND_PREFIX = os.getenv("COMMAND_PREFIX", "&")
+SCRAPE_TIMEOUT_SECONDS = max(5, int(os.getenv("SCRAPE_TIMEOUT_SECONDS", "30")))
+MAX_QUERY_LENGTH = 300
+
+
+@dataclass
+class MediaResult:
+    url: Optional[str] = None
+    referer: Optional[str] = None
+    kind: Optional[str] = None
+
+
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix="&", intents=intents)
+bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents)
 
-async def scrape_media_stream(query_or_url: str):
-    found_media = {"url": None, "referer": None, "type": None}
-    
-    # التحقق مما إذا كان المدخل رابطاً أم اسم فيلم
-    is_url = query_or_url.startswith("http://") or query_or_url.startswith("https://")
-    target_url = query_or_url if is_url else f"{TARGET_SITE_URL}/?s={urllib.parse.quote(query_or_url)}"
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
+def is_http_url(value: str) -> bool:
+    parsed = urllib.parse.urlparse(value)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def find_candidate_urls(value: object) -> list[str]:
+    """Find ordinary HTTP(S) URLs in JSON-like data without assuming a fixed schema."""
+    text = json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value
+    return re.findall(r"https?://[^\s\"'<>\\]+", text)
+
+
+def choose_candidate(urls: list[str]) -> Optional[str]:
+    keywords = ("embed", "player", "stream", "m3u8", "mp4")
+    for url in urls:
+        if any(keyword in url.lower() for keyword in keywords):
+            return url.rstrip(".,)")
+    return None
+
+
+async def scrape_media_stream(query_or_url: str) -> MediaResult:
+    query_or_url = query_or_url.strip()
+    if not query_or_url:
+        raise ValueError("يجب إدخال اسم أو رابط صالح.")
+    if len(query_or_url) > MAX_QUERY_LENGTH:
+        raise ValueError(f"المدخل طويل جدًا؛ الحد الأقصى هو {MAX_QUERY_LENGTH} حرفًا.")
+
+    is_url = is_http_url(query_or_url)
+    target_url = query_or_url if is_url else f"{TARGET_SITE_URL}/?s={urllib.parse.quote_plus(query_or_url)}"
+    result = MediaResult()
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled"
-            ]
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
         )
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-        )
-        page = await context.new_page()
-
-        # التقاط أي شبكة مباشرة (.m3u8 أو .mp4)
-        async def handle_request(request):
-            url = request.url
-            if re.search(r"\.(m3u8|mp4)(\?|$)", url, re.IGNORECASE):
-                if not found_media["url"]:
-                    found_media["url"] = url
-                    found_media["referer"] = request.headers.get("referer", TARGET_SITE_URL)
-                    found_media["type"] = "Direct Stream (m3u8/mp4)"
-
-        page.on("request", handle_request)
-
         try:
-            # 1. الانتقال للرابط المباشر أو صفحة البحث
-            await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(2)
+            context = await browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36"
+                )
+            )
+            page = await context.new_page()
 
-            # 2. إذا كان بحثاً عادياً، نقر على أول نتيجة ليدخل صفحة الفيلم
+            def handle_request(request) -> None:
+                url = request.url
+                if result.url is None and re.search(r"\.(m3u8|mp4)(?:\?|$)", url, re.IGNORECASE):
+                    result.url = url
+                    result.referer = request.headers.get("referer") or page.url
+                    result.kind = "Direct media request"
+
+            page.on("request", handle_request)
+            await page.goto(target_url, wait_until="domcontentloaded", timeout=SCRAPE_TIMEOUT_SECONDS * 1000)
+            await page.wait_for_timeout(1500)
+
             if not is_url:
-                first_card = page.locator("a[href*='film'], a[href*='video'], a[href*='watch'], .media-block a, article a").first
-                if await first_card.count() > 0:
-                    await first_card.click()
-                    await page.wait_for_load_state("domcontentloaded")
-                    await asyncio.sleep(2)
+                first_card = page.locator(
+                    "a[href*='film'], a[href*='video'], a[href*='watch'], .media-block a, article a"
+                ).first
+                if await first_card.count():
+                    await first_card.click(timeout=5000)
+                    await page.wait_for_load_state("domcontentloaded", timeout=SCRAPE_TIMEOUT_SECONDS * 1000)
+                    await page.wait_for_timeout(1000)
 
-            # 3. فحص واستخراج البيانات من كائن JSON المحمي (scrape-page-bootstrap-v23)
-            script_element = page.locator("script#scrape-page-bootstrap-v23")
-            if await script_element.count() > 0:
-                json_content = await script_element.inner_text()
-                data = json.loads(json_content)
-                
-                # استخراج الرابط المباشر للمشغل من التشفير
-                json_str = json.dumps(data)
-                urls = re.findall(r'https?://[^\s"\'\\]+', json_str)
-                for url in urls:
-                    if any(k in url for k in ["embed", "player", "vidsrc", "m3u8", "stream"]):
-                        found_media["url"] = url
-                        found_media["referer"] = page.url
-                        found_media["type"] = "Extracted Json Stream"
-                        break
+            if result.url is None:
+                script_element = page.locator("script#scrape-page-bootstrap-v23").first
+                if await script_element.count():
+                    raw_json = await script_element.text_content()
+                    if raw_json:
+                        try:
+                            candidates = find_candidate_urls(json.loads(raw_json))
+                        except json.JSONDecodeError:
+                            candidates = find_candidate_urls(raw_json)
+                        candidate = choose_candidate(candidates)
+                        if candidate:
+                            result.url = candidate
+                            result.referer = page.url
+                            result.kind = "Page data candidate"
 
-            # 4. خيار احتياطي: جلب روابط الـ iframe الخارجية إن وجدت
-            if not found_media["url"]:
+            if result.url is None:
                 for frame in page.frames:
-                    if any(k in frame.url for k in ["embed", "player", "vidsrc", "stream"]):
-                        if frame.url != page.url and not frame.url.startswith("about:"):
-                            found_media["url"] = frame.url
-                            found_media["referer"] = page.url
-                            found_media["type"] = "Embed Player Server"
-                            break
-
-        except Exception as e:
-            print(f"[Scraper Error]: {e}")
+                    frame_url = frame.url
+                    if frame_url != page.url and not frame_url.startswith("about:") and any(
+                        key in frame_url.lower() for key in ("embed", "player", "stream")
+                    ):
+                        result.url = frame_url
+                        result.referer = page.url
+                        result.kind = "Embedded player page"
+                        break
+        except PlaywrightTimeoutError:
+            raise TimeoutError("انتهت مهلة فتح الصفحة أو انتظارها.")
         finally:
             await browser.close()
 
-    return found_media
+    return result
+
 
 @bot.event
-async def on_ready():
-    print(f"تم تسجيل الدخول بنجاح كـ {bot.user.name}")
-    print("البوت جاهز لاستقبال الرابط أو الاسم عبر &watch")
+async def on_ready() -> None:
+    logger.info("تم تسجيل الدخول بنجاح باسم %s", bot.user)
+    logger.info("البوت جاهز. استخدم %s%s <اسم أو رابط>", COMMAND_PREFIX, "watch")
+
 
 @bot.command(name="watch")
-async def watch(ctx, *, query_or_url: str):
-    msg = await ctx.send(f"🔍 جاري المعالجة واستخراج المشغل لـ: **{query_or_url}**...")
-    
+@commands.cooldown(rate=1, per=15, type=commands.BucketType.user)
+async def watch(ctx: commands.Context, *, query_or_url: str) -> None:
+    message = await ctx.send("جاري معالجة المدخل واستخراج البيانات...")
     try:
-        media_data = await scrape_media_stream(query_or_url)
-
-        if media_data["url"]:
-            embed = discord.Embed(
-                title=f"🎬 تم العثور على المشغل!",
-                color=discord.Color.green()
-            )
-            embed.add_field(name="المدخل", value=query_or_url, inline=False)
-            embed.add_field(name="نوع المشغل", value=media_data["type"], inline=False)
-            embed.add_field(name="رابط المشغل / البث", value=f"```{media_data['url']}```", inline=False)
-            if media_data["referer"]:
-                embed.add_field(name="المصدر (Referer)", value=media_data["referer"], inline=False)
-            
-            await msg.edit(content=None, embed=embed)
+        result = await scrape_media_stream(query_or_url)
+        if result.url:
+            embed = discord.Embed(title="تم العثور على رابط", color=discord.Color.green())
+            embed.add_field(name="المدخل", value=query_or_url[:1024], inline=False)
+            embed.add_field(name="النوع", value=result.kind or "غير محدد", inline=False)
+            embed.add_field(name="الرابط", value=result.url[:1024], inline=False)
+            if result.referer:
+                embed.add_field(name="المصدر", value=result.referer[:1024], inline=False)
+            await message.edit(content=None, embed=embed)
         else:
-            embed = discord.Embed(
-                title="❌ لم يتم العثور على رابط",
-                description=f"تعذر استخراج رابط المشغل من المدخل المرفق.",
-                color=discord.Color.red()
-            )
-            await msg.edit(content=None, embed=embed)
+            await message.edit(content="لم يتم العثور على رابط مناسب في الصفحة.")
+    except (ValueError, TimeoutError) as exc:
+        await message.edit(content=f"تعذر إكمال الطلب: {exc}")
+    except Exception:
+        logger.exception("Unexpected error while processing watch command")
+        await message.edit(content="حدث خطأ غير متوقع. راجع سجل التشغيل للتفاصيل.")
 
-    except Exception as e:
-        await msg.edit(content=f"⚠️ حدث خطأ أثناء تنفيذ الأمر: `{e}`")
+
+@watch.error
+async def watch_error(ctx: commands.Context, error: commands.CommandError) -> None:
+    if isinstance(error, commands.CommandOnCooldown):
+        await ctx.send(f"حاول مرة أخرى بعد {error.retry_after:.1f} ثانية.")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f"الاستخدام الصحيح: `{COMMAND_PREFIX}watch <اسم أو رابط>`")
+    elif isinstance(error, commands.CommandNotFound):
+        return
+    else:
+        logger.error(
+            "Command error: %s",
+            error,
+            exc_info=(type(error), error, error.__traceback__),
+        )
+        await ctx.send("تعذر تنفيذ الأمر بسبب خطأ في الطلب.")
+
 
 if __name__ == "__main__":
-    if DISCORD_TOKEN:
-        bot.run(DISCORD_TOKEN)
-    else:
-        print("خطأ: DISCORD_TOKEN غير محدد في متغيرات البيئة!")
+    if not DISCORD_TOKEN:
+        raise SystemExit("DISCORD_TOKEN غير محدد. عيّنه كمتغير بيئة قبل تشغيل البوت.")
+    asyncio.run(bot.start(DISCORD_TOKEN))
