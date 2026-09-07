@@ -51,7 +51,7 @@ def find_candidate_urls(value: object) -> list[str]:
 
 
 def choose_candidate(urls: list[str]) -> Optional[str]:
-    keywords = ("embed", "player", "stream", "m3u8", "mp4", "/media/page/")
+    keywords = ("embed", "player", "stream", "m3u8", "mp4", "/media/page/", "/media-edge/")
     for url in urls:
         if any(keyword in url.lower() for keyword in keywords):
             return url.rstrip(".,)")
@@ -116,7 +116,24 @@ async def scrape_media_stream(query_or_url: str) -> MediaResult:
                         except json.JSONDecodeError:
                             candidates = find_candidate_urls(raw_json)
                         candidate = choose_candidate(candidates)
-                        if candidate:
+                        if candidate and "/media/page/" in candidate:
+                            try:
+                                source_response = await context.request.get(
+                                    candidate,
+                                    headers={"Referer": page.url},
+                                    timeout=SCRAPE_TIMEOUT_SECONDS * 1000,
+                                )
+                                if source_response.ok:
+                                    source_payload = await source_response.text()
+                                    source_candidates = find_candidate_urls(source_payload)
+                                    resolved = choose_candidate(source_candidates)
+                                    if resolved and "/media/page/" not in resolved:
+                                        result.url = resolved
+                                        result.referer = page.url
+                                        result.kind = "Resolved media player"
+                            except Exception as source_error:
+                                logger.warning("Could not resolve media source: %s", source_error)
+                        elif candidate:
                             result.url = candidate
                             result.referer = page.url
                             result.kind = "Page data / media source candidate"
