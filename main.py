@@ -21,6 +21,7 @@ logger = logging.getLogger("discord-scraper")
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 TARGET_SITE_URL = os.getenv("TARGET_SITE_URL", "https://shaiid4u.co").strip().rstrip("/")
+SEARCH_PATH = os.getenv("SEARCH_PATH", "/search").strip() or "/search"
 COMMAND_PREFIX = os.getenv("COMMAND_PREFIX", "&")
 SCRAPE_TIMEOUT_SECONDS = max(5, int(os.getenv("SCRAPE_TIMEOUT_SECONDS", "30")))
 MAX_QUERY_LENGTH = 300
@@ -50,7 +51,7 @@ def find_candidate_urls(value: object) -> list[str]:
 
 
 def choose_candidate(urls: list[str]) -> Optional[str]:
-    keywords = ("embed", "player", "stream", "m3u8", "mp4")
+    keywords = ("embed", "player", "stream", "m3u8", "mp4", "/media/page/")
     for url in urls:
         if any(keyword in url.lower() for keyword in keywords):
             return url.rstrip(".,)")
@@ -65,7 +66,7 @@ async def scrape_media_stream(query_or_url: str) -> MediaResult:
         raise ValueError(f"المدخل طويل جدًا؛ الحد الأقصى هو {MAX_QUERY_LENGTH} حرفًا.")
 
     is_url = is_http_url(query_or_url)
-    target_url = query_or_url if is_url else f"{TARGET_SITE_URL}/?s={urllib.parse.quote_plus(query_or_url)}"
+    target_url = query_or_url if is_url else f"{TARGET_SITE_URL}{SEARCH_PATH}?s={urllib.parse.quote_plus(query_or_url)}"
     result = MediaResult()
 
     async with async_playwright() as playwright:
@@ -92,10 +93,13 @@ async def scrape_media_stream(query_or_url: str) -> MediaResult:
             page.on("request", handle_request)
             await page.goto(target_url, wait_until="domcontentloaded", timeout=SCRAPE_TIMEOUT_SECONDS * 1000)
             await page.wait_for_timeout(1500)
+            body_text = (await page.locator("body").inner_text()).strip().lower()
+            if body_text in {"forbidden", "access denied"} or "just a moment" in body_text:
+                raise RuntimeError("الموقع منع الوصول الآلي من هذا السيرفر.")
 
             if not is_url:
                 first_card = page.locator(
-                    "a[href*='film'], a[href*='video'], a[href*='watch'], .media-block a, article a"
+                    "a.show-card, a[href*='/film/'], a[href*='/series/'], a[href*='video'], a[href*='watch'], .media-block a, article a"
                 ).first
                 if await first_card.count():
                     await first_card.click(timeout=5000)
@@ -115,7 +119,7 @@ async def scrape_media_stream(query_or_url: str) -> MediaResult:
                         if candidate:
                             result.url = candidate
                             result.referer = page.url
-                            result.kind = "Page data candidate"
+                            result.kind = "Page data / media source candidate"
 
             if result.url is None:
                 for frame in page.frames:
@@ -157,7 +161,7 @@ async def watch(ctx: commands.Context, *, query_or_url: str) -> None:
             await message.edit(content=None, embed=embed)
         else:
             await message.edit(content="لم يتم العثور على رابط مناسب في الصفحة.")
-    except (ValueError, TimeoutError) as exc:
+    except (ValueError, TimeoutError, RuntimeError) as exc:
         await message.edit(content=f"تعذر إكمال الطلب: {exc}")
     except Exception:
         logger.exception("Unexpected error while processing watch command")
