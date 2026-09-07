@@ -1,16 +1,17 @@
 import os
 import re
+import json
 import asyncio
 import urllib.parse
-from discord.ext import commands
 import discord
+from discord.ext import commands
 from playwright.async_api import async_playwright
 
-# جلب المتغيرات
+# جلب المتغيرات من بيئة التشغيل
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-TARGET_SITE_URL = os.getenv("TARGET_SITE_URL", "https://wi.txcima.com").rstrip('/')
+TARGET_SITE_URL = os.getenv("TARGET_SITE_URL", "https://shaiid4u.co").rstrip('/')
 
-# إعداد البوت مع الصلاحيات
+# إعداد البوت والصلاحيات
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="&", intents=intents)
@@ -34,7 +35,7 @@ async def scrape_media_stream(query: str):
         )
         page = await context.new_page()
 
-        # التقاط روابط الفيديو المباشرة أثناء التحميل
+        # التقاط أي طلبات شبكة مباشرة (.m3u8 أو .mp4)
         async def handle_request(request):
             url = request.url
             if re.search(r"\.(m3u8|mp4)(\?|$)", url, re.IGNORECASE):
@@ -46,33 +47,39 @@ async def scrape_media_stream(query: str):
         page.on("request", handle_request)
 
         try:
-            # 1. فتح صفحة البحث
-            await page.goto(search_url, wait_until="networkidle", timeout=30000)
-            
-            # 2. العثور على أول رابط فيلم/مسلسل والنقر عليه
-            first_result = page.locator("a[href*='film'], a[href*='series'], .BlockItem a, article a").first
-            if await first_result.count() > 0:
-                await first_result.click()
-                await page.wait_for_load_state("domcontentloaded", timeout=20000)
+            # 1. الانتقال لصفحة البحث
+            await page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(2)
 
-            # 3. محاولة النقر على مشغل الفيديو
-            play_element = page.locator("iframe, .EmbedContainer, #player").first
-            if await play_element.count() > 0:
-                await play_element.click(force=True)
+            # 2. النقر على أول نتيجة ظهرت في البحث
+            first_card = page.locator("a[href*='film'], a[href*='video'], a[href*='watch'], .media-block a").first
+            if await first_card.count() > 0:
+                await first_card.click()
+                await page.wait_for_load_state("domcontentloaded")
+                await asyncio.sleep(2)
 
-            # 4. الانتظار لالتقاط الفيديو
-            for _ in range(10):
-                if found_media["url"]:
-                    break
-                await asyncio.sleep(1)
+            # 3. فحص واستخراج البيانات من كائن JSON المحمي (scrape-page-bootstrap-v23)
+            script_element = page.locator("script#scrape-page-bootstrap-v23")
+            if await script_element.count() > 0:
+                json_content = await script_element.inner_text()
+                data = json.loads(json_content)
+                
+                # استخراج الرابط المباشر للمشغل من التشفير
+                json_str = json.dumps(data)
+                urls = re.findall(r'https?://[^\s"\'\\]+', json_str)
+                for url in urls:
+                    if any(k in url for k in ["embed", "player", "vidsrc", "m3u8", "stream"]):
+                        found_media["url"] = url
+                        found_media["referer"] = page.url
+                        found_media["type"] = "Extracted Json Stream"
+                        break
 
-            # 5. إذا لم يجد رابط مباشر، يأخذ رابط المشغل المضمن (iframe)
+            # 4. خيار احتياطي: جلب روابط الـ iframe الخارجية إن وجدت
             if not found_media["url"]:
                 for frame in page.frames:
-                    frame_url = frame.url
-                    if any(k in frame_url for k in ["embed", "player", "vidsrc", "stream", "watch"]):
-                        if frame_url != page.url and not frame_url.startswith("about:"):
-                            found_media["url"] = frame_url
+                    if any(k in frame.url for k in ["embed", "player", "vidsrc", "stream"]):
+                        if frame.url != page.url and not frame.url.startswith("about:"):
+                            found_media["url"] = frame.url
                             found_media["referer"] = page.url
                             found_media["type"] = "Embed Player Server"
                             break
@@ -87,11 +94,11 @@ async def scrape_media_stream(query: str):
 @bot.event
 async def on_ready():
     print(f"تم تسجيل الدخول بنجاح كـ {bot.user.name}")
-    print("البوت جاهز لاستقبال الأوامر مثل &watch")
+    print("البوت جاهز لاستقبال الأوامر عبر &watch")
 
 @bot.command(name="watch")
 async def watch(ctx, *, query: str):
-    msg = await ctx.send(f"🔍 جاري البحث واستخراج المشغل المباشر لـ: **{query}**...")
+    msg = await ctx.send(f"🔍 جاري البحث واستخراج المشغل لـ: **{query}**...")
     
     try:
         media_data = await scrape_media_stream(query)
@@ -122,4 +129,4 @@ if __name__ == "__main__":
     if DISCORD_TOKEN:
         bot.run(DISCORD_TOKEN)
     else:
-        print("خطأ: DISCORD_TOKEN غير موجود في متغيرات البيئة!")
+        print("خطأ: DISCORD_TOKEN غير محدد في متغيرات البيئة!")
