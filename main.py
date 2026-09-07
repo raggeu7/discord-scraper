@@ -12,7 +12,6 @@ from discord.ext import commands
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 
-from egybest_client import EgyBestAPIError, EgyBestClient
 
 
 logging.basicConfig(
@@ -39,7 +38,6 @@ class MediaResult:
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents)
-egybest = EgyBestClient()
 
 
 def is_http_url(value: str) -> bool:
@@ -166,34 +164,37 @@ async def on_ready() -> None:
 
 
 @bot.command(name="egy")
-@commands.cooldown(rate=1, per=10, type=commands.BucketType.user)
+@commands.cooldown(rate=1, per=15, type=commands.BucketType.user)
 async def egy(ctx: commands.Context, *, query: str) -> None:
-    message = await ctx.send("جاري البحث في EgyBest API...")
+    """Search the configured direct source and return its player link."""
+    message = await ctx.send("جاري البحث المباشر عن الفيلم...")
     try:
-        results = await egybest.search(query, result_type="movie")
-        if not results:
-            await message.edit(content=f"لم يتم العثور على نتائج للفيلم: **{query[:200]}**")
+        result = await scrape_media_stream(query)
+        if not result.url:
+            await message.edit(
+                content=(
+                    "لم يتم العثور على مشغل. تأكد من اسم الفيلم أو أن المصدر المباشر "
+                    "يسمح بالوصول من Railway."
+                )
+            )
             return
 
         embed = discord.Embed(
-            title="نتيجة بحث EgyBest",
-            description=f"نتائج البحث عن: **{query[:200]}**",
-            color=discord.Color.blue(),
+            title="تم العثور على المشغل",
+            description=f"نتيجة البحث عن: **{query[:200]}**",
+            color=discord.Color.green(),
         )
-        for index, item in enumerate(results[:5], start=1):
-            details = f"[فتح الرابط]({item.url})"
-            if item.kind:
-                details += f"\nالنوع: {item.kind}"
-            if item.rating:
-                details += f"\nالتقييم: {item.rating}"
-            embed.add_field(name=f"{index}. {item.title[:240]}", value=details[:1024], inline=False)
-        embed.set_footer(text=f"تم العثور على {len(results)} نتيجة")
+        embed.add_field(name="رابط المشغل", value=f"[فتح المشغل]({result.url})", inline=False)
+        embed.add_field(name="نوع النتيجة", value=result.kind or "غير محدد", inline=False)
+        if result.referer:
+            embed.add_field(name="صفحة المصدر", value=result.referer[:1024], inline=False)
+        embed.set_footer(text="قد تكون بعض الروابط مؤقتة وتنتهي صلاحيتها حسب المصدر")
         await message.edit(content=None, embed=embed)
-    except EgyBestAPIError as exc:
-        await message.edit(content=f"تعذر البحث في EgyBest API: {exc}")
+    except (ValueError, TimeoutError, RuntimeError) as exc:
+        await message.edit(content=f"تعذر البحث المباشر: {exc}")
     except Exception:
-        logger.exception("Unexpected error while processing egy command")
-        await message.edit(content="حدث خطأ غير متوقع أثناء البحث. راجع سجل التشغيل.")
+        logger.exception("Unexpected error while processing direct egy command")
+        await message.edit(content="حدث خطأ غير متوقع أثناء البحث المباشر. راجع سجل التشغيل.")
 
 
 @egy.error
@@ -201,10 +202,10 @@ async def egy_error(ctx: commands.Context, error: commands.CommandError) -> None
     if isinstance(error, commands.CommandOnCooldown):
         await ctx.send(f"حاول مرة أخرى بعد {error.retry_after:.1f} ثانية.")
     elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(f"الاستخدام الصحيح: `{COMMAND_PREFIX}egy <اسم الفيلم>`")
+        await ctx.send(f"الاستخدام الصحيح: `{COMMAND_PREFIX}egy <اسم الفيلم أو المسلسل>`")
     else:
         logger.error("Egy command error: %s", error, exc_info=(type(error), error, error.__traceback__))
-        await ctx.send("تعذر تنفيذ أمر البحث.")
+        await ctx.send("تعذر تنفيذ أمر البحث المباشر.")
 
 
 @bot.command(name="watch")
