@@ -16,9 +16,12 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="&", intents=intents)
 
-async def scrape_media_stream(query: str):
+async def scrape_media_stream(query_or_url: str):
     found_media = {"url": None, "referer": None, "type": None}
-    search_url = f"{TARGET_SITE_URL}/?s={urllib.parse.quote(query)}"
+    
+    # التحقق مما إذا كان المدخل رابطاً أم اسم فيلم
+    is_url = query_or_url.startswith("http://") or query_or_url.startswith("https://")
+    target_url = query_or_url if is_url else f"{TARGET_SITE_URL}/?s={urllib.parse.quote(query_or_url)}"
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -35,7 +38,7 @@ async def scrape_media_stream(query: str):
         )
         page = await context.new_page()
 
-        # التقاط أي طلبات شبكة مباشرة (.m3u8 أو .mp4)
+        # التقاط أي شبكة مباشرة (.m3u8 أو .mp4)
         async def handle_request(request):
             url = request.url
             if re.search(r"\.(m3u8|mp4)(\?|$)", url, re.IGNORECASE):
@@ -47,16 +50,17 @@ async def scrape_media_stream(query: str):
         page.on("request", handle_request)
 
         try:
-            # 1. الانتقال لصفحة البحث
-            await page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+            # 1. الانتقال للرابط المباشر أو صفحة البحث
+            await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
             await asyncio.sleep(2)
 
-            # 2. النقر على أول نتيجة ظهرت في البحث
-            first_card = page.locator("a[href*='film'], a[href*='video'], a[href*='watch'], .media-block a").first
-            if await first_card.count() > 0:
-                await first_card.click()
-                await page.wait_for_load_state("domcontentloaded")
-                await asyncio.sleep(2)
+            # 2. إذا كان بحثاً عادياً، نقر على أول نتيجة ليدخل صفحة الفيلم
+            if not is_url:
+                first_card = page.locator("a[href*='film'], a[href*='video'], a[href*='watch'], .media-block a, article a").first
+                if await first_card.count() > 0:
+                    await first_card.click()
+                    await page.wait_for_load_state("domcontentloaded")
+                    await asyncio.sleep(2)
 
             # 3. فحص واستخراج البيانات من كائن JSON المحمي (scrape-page-bootstrap-v23)
             script_element = page.locator("script#scrape-page-bootstrap-v23")
@@ -94,20 +98,21 @@ async def scrape_media_stream(query: str):
 @bot.event
 async def on_ready():
     print(f"تم تسجيل الدخول بنجاح كـ {bot.user.name}")
-    print("البوت جاهز لاستقبال الأوامر عبر &watch")
+    print("البوت جاهز لاستقبال الرابط أو الاسم عبر &watch")
 
 @bot.command(name="watch")
-async def watch(ctx, *, query: str):
-    msg = await ctx.send(f"🔍 جاري البحث واستخراج المشغل لـ: **{query}**...")
+async def watch(ctx, *, query_or_url: str):
+    msg = await ctx.send(f"🔍 جاري المعالجة واستخراج المشغل لـ: **{query_or_url}**...")
     
     try:
-        media_data = await scrape_media_stream(query)
+        media_data = await scrape_media_stream(query_or_url)
 
         if media_data["url"]:
             embed = discord.Embed(
-                title=f"🎬 تم العثور على المشغل لـ: {query}",
+                title=f"🎬 تم العثور على المشغل!",
                 color=discord.Color.green()
             )
+            embed.add_field(name="المدخل", value=query_or_url, inline=False)
             embed.add_field(name="نوع المشغل", value=media_data["type"], inline=False)
             embed.add_field(name="رابط المشغل / البث", value=f"```{media_data['url']}```", inline=False)
             if media_data["referer"]:
@@ -117,7 +122,7 @@ async def watch(ctx, *, query: str):
         else:
             embed = discord.Embed(
                 title="❌ لم يتم العثور على رابط",
-                description=f"تعذر استخراج رابط مباشر للعمل: **{query}**.",
+                description=f"تعذر استخراج رابط المشغل من المدخل المرفق.",
                 color=discord.Color.red()
             )
             await msg.edit(content=None, embed=embed)
