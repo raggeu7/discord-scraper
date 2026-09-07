@@ -12,6 +12,8 @@ from discord.ext import commands
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 
+from egybest_client import EgyBestAPIError, EgyBestClient
+
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -37,6 +39,7 @@ class MediaResult:
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents)
+egybest = EgyBestClient()
 
 
 def is_http_url(value: str) -> bool:
@@ -160,6 +163,48 @@ async def scrape_media_stream(query_or_url: str) -> MediaResult:
 async def on_ready() -> None:
     logger.info("تم تسجيل الدخول بنجاح باسم %s", bot.user)
     logger.info("البوت جاهز. استخدم %s%s <اسم أو رابط>", COMMAND_PREFIX, "watch")
+
+
+@bot.command(name="egy")
+@commands.cooldown(rate=1, per=10, type=commands.BucketType.user)
+async def egy(ctx: commands.Context, *, query: str) -> None:
+    message = await ctx.send("جاري البحث في EgyBest API...")
+    try:
+        results = await egybest.search(query, result_type="movie")
+        if not results:
+            await message.edit(content=f"لم يتم العثور على نتائج للفيلم: **{query[:200]}**")
+            return
+
+        embed = discord.Embed(
+            title="نتيجة بحث EgyBest",
+            description=f"نتائج البحث عن: **{query[:200]}**",
+            color=discord.Color.blue(),
+        )
+        for index, item in enumerate(results[:5], start=1):
+            details = f"[فتح الرابط]({item.url})"
+            if item.kind:
+                details += f"\nالنوع: {item.kind}"
+            if item.rating:
+                details += f"\nالتقييم: {item.rating}"
+            embed.add_field(name=f"{index}. {item.title[:240]}", value=details[:1024], inline=False)
+        embed.set_footer(text=f"تم العثور على {len(results)} نتيجة")
+        await message.edit(content=None, embed=embed)
+    except EgyBestAPIError as exc:
+        await message.edit(content=f"تعذر البحث في EgyBest API: {exc}")
+    except Exception:
+        logger.exception("Unexpected error while processing egy command")
+        await message.edit(content="حدث خطأ غير متوقع أثناء البحث. راجع سجل التشغيل.")
+
+
+@egy.error
+async def egy_error(ctx: commands.Context, error: commands.CommandError) -> None:
+    if isinstance(error, commands.CommandOnCooldown):
+        await ctx.send(f"حاول مرة أخرى بعد {error.retry_after:.1f} ثانية.")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f"الاستخدام الصحيح: `{COMMAND_PREFIX}egy <اسم الفيلم>`")
+    else:
+        logger.error("Egy command error: %s", error, exc_info=(type(error), error, error.__traceback__))
+        await ctx.send("تعذر تنفيذ أمر البحث.")
 
 
 @bot.command(name="watch")
